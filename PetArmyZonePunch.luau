@@ -32,6 +32,7 @@ local FOLLOWER_WAIT_TIMEOUT = 12
 local FOLLOWER_MAX_DISTANCE = 220
 local FOLLOWER_MIN_CLOSE = 80
 local FOLLOWER_SETTLE_TIME = 1
+local SNIPE_MAX_AGE = 30
 
 local state = {
 	running = true,
@@ -44,6 +45,8 @@ local state = {
 	autoSummonHeartbeat = 0,
 	autoEquipBest = false,
 	autoEquipBestRunId = 0,
+	snipeAnnouncements = true,
+	pendingSnipe = nil,
 	antiAfk = false,
 	antiAfkRunId = 0,
 	zone = nil,
@@ -229,6 +232,111 @@ local function announcementMatches(entry, zone, rarityLabels)
 	return false
 end
 
+local function zoneFromAnnouncement(entry)
+	if not entry then
+		return nil
+	end
+
+	local zoneNum = tonumber(entry.zoneNum)
+	if zoneNum then
+		for _, zone in ipairs(Config.Zones) do
+			if zone.Index == zoneNum then
+				return zone
+			end
+		end
+	end
+
+	if entry.zone and entry.zone ~= "???" then
+		local announcedName = tostring(entry.zone):lower():gsub("^the ", "")
+		for _, zone in ipairs(Config.Zones) do
+			local zoneName = tostring(zone.Name or zone.Id):lower():gsub("^the ", "")
+			if zoneName == announcedName or tostring(zone.Id):lower() == announcedName then
+				return zone
+			end
+		end
+	end
+
+	return nil
+end
+
+local function buildSnipe(entry)
+	if not entry or entry._snipeHandled or not state.snipeAnnouncements then
+		return nil
+	end
+
+	if os.clock() - (entry.received or 0) > SNIPE_MAX_AGE then
+		return nil
+	end
+
+	local zone = zoneFromAnnouncement(entry)
+	if not zone then
+		return nil
+	end
+
+	local _, tierByLabel = getRarityChoices(zone)
+	local tier = entry.rarity and tierByLabel[entry.rarity]
+	if not tier then
+		return nil
+	end
+
+	local selected = false
+	for _, label in ipairs(state.rarityLabels) do
+		if label == entry.rarity then
+			selected = true
+			break
+		end
+	end
+
+	if not selected then
+		return nil
+	end
+
+	return {
+		entry = entry,
+		zone = zone,
+		tierSet = { [tier] = true },
+		tierByLabel = tierByLabel,
+		rarityLabels = { entry.rarity },
+		kind = entry.kind,
+	}
+end
+
+local function takePendingSnipe()
+	if not state.snipeAnnouncements then
+		return nil
+	end
+
+	local now = os.clock()
+	for index = #announcementHistory, 1, -1 do
+		local entry = announcementHistory[index]
+		if now - entry.received > SNIPE_MAX_AGE then
+			break
+		end
+
+		local snipe = buildSnipe(entry)
+		if snipe then
+			entry._snipeHandled = true
+			return snipe
+		end
+	end
+
+	return nil
+end
+
+local function markAnnouncementHandled(zone, target)
+	local kind = target and target:GetAttribute("Kind")
+	if not kind then
+		return
+	end
+
+	for index = #announcementHistory, 1, -1 do
+		local entry = announcementHistory[index]
+		if entry.kind == kind and announcementInZone(entry, zone) then
+			entry._snipeHandled = true
+		end
+	end
+end
+
 local function recentZoneAnnouncement(zone, since)
 	for index = #announcementHistory, 1, -1 do
 		local entry = announcementHistory[index]
@@ -319,14 +427,15 @@ local function isValidTarget(target, zoneId, tierSet)
 	return target.PrimaryPart ~= nil
 end
 
-local function isAnnouncedTarget(creature, zoneId, tierSet)
+local function isAnnouncedTarget(creature, zoneId, tierSet, zone, tierByLabel)
 	local kind = creature:GetAttribute("Kind")
 	local entry = kind and announcedKinds[kind]
 	if not entry or os.clock() - entry.received > 45 then
 		return false
 	end
 
-	local zone = state.zone
+	zone = zone or state.zone
+	tierByLabel = tierByLabel or state.tierByLabel
 	if not zone or zone.Id ~= zoneId then
 		return false
 	end
@@ -335,28 +444,34 @@ local function isAnnouncedTarget(creature, zoneId, tierSet)
 		return false
 	end
 
-	local tier = state.tierByLabel[entry.rarity]
+	local tier = tierByLabel[entry.rarity]
 	return tier ~= nil and tierSet[tier] == true
 end
 
-local function findTarget(zoneId, tierSet, referencePosition)
+local function findTarget(zoneId, tierSet, referencePosition, ctx)
+	local wantKind = ctx and ctx.kind
+	local zone = ctx and ctx.zone or state.zone
+	local tierByLabel = ctx and ctx.tierByLabel or state.tierByLabel
 	local closestTarget = nil
 	local closestDistance = math.huge
 	local closestAnnounced = false
 
 	for _, creature in ipairs(WildCreatures:GetChildren()) do
 		if isValidTarget(creature, zoneId, tierSet) then
-			local distance = referencePosition
-				and (creature.PrimaryPart.Position - referencePosition).Magnitude
-				or 0
-			local announced = isAnnouncedTarget(creature, zoneId, tierSet)
+			local kind = creature:GetAttribute("Kind")
+			if not wantKind or kind == wantKind then
+				local distance = referencePosition
+					and (creature.PrimaryPart.Position - referencePosition).Magnitude
+					or 0
+				local announced = isAnnouncedTarget(creature, zoneId, tierSet, zone, tierByLabel)
 
-			if (announced and not closestAnnounced)
-				or (announced == closestAnnounced and distance < closestDistance)
-			then
-				closestTarget = creature
-				closestDistance = distance
-				closestAnnounced = announced
+				if (announced and not closestAnnounced)
+					or (announced == closestAnnounced and distance < closestDistance)
+				then
+					closestTarget = creature
+					closestDistance = distance
+					closestAnnounced = announced
+				end
 			end
 		end
 	end
@@ -432,6 +547,7 @@ local status = BattleSection:AddParagraph({
 })
 
 local rarityDropdown = nil
+local autoSnipeToggle = nil
 local autoSummonToggle = nil
 local antiAfkToggle = nil
 local homeCycleWaitSlider = nil
@@ -518,6 +634,20 @@ BattleSection:AddToggle({
 		end
 	end,
 })
+
+autoSnipeToggle = BattleSection:AddToggle({
+	Name = "Snipe Matching Announcements",
+	Description = "When a selected rarity is announced in any zone, travel to that zone and fight it.",
+	Default = true,
+	Flag = "SnipeAnnouncements",
+	Callback = function(enabled)
+		state.snipeAnnouncements = enabled
+		if not enabled then
+			state.pendingSnipe = nil
+		end
+	end,
+})
+state.snipeAnnouncements = autoSnipeToggle.Value ~= false
 
 homeCycleWaitSlider = BattleSection:AddSlider({
 	Name = "Home Cycle Wait",
@@ -819,7 +949,7 @@ local function getSpawnByName(spawnFolder, name)
 	return nil
 end
 
-local function teleportToSpawn(spawn, zone, tierSet, runId)
+local function teleportToSpawn(spawn, zone, tierSet, runId, ctx)
 	local character = getCharacter()
 	if not character or not spawn then
 		return nil
@@ -836,10 +966,10 @@ local function teleportToSpawn(spawn, zone, tierSet, runId)
 	end
 
 	local _, _, rootPart = getCharacter()
-	return findTarget(zone.Id, tierSet, rootPart and rootPart.Position)
+	return findTarget(zone.Id, tierSet, rootPart and rootPart.Position, ctx)
 end
 
-local function teleportThroughSpawns(zone, tierSet, runId)
+local function teleportThroughSpawns(zone, tierSet, runId, ctx)
 	local deadline = os.clock() + 6
 	local spawnFolder = nil
 	local easySpawn = nil
@@ -859,7 +989,7 @@ local function teleportThroughSpawns(zone, tierSet, runId)
 	end
 
 	setStatus("Moving to EasySpawn...")
-	local target = teleportToSpawn(easySpawn, zone, tierSet, runId)
+	local target = teleportToSpawn(easySpawn, zone, tierSet, runId, ctx)
 	if target then
 		return target
 	end
@@ -877,7 +1007,7 @@ local function teleportThroughSpawns(zone, tierSet, runId)
 		end
 
 		local _, _, rootPart = getCharacter()
-		target = findTarget(zone.Id, tierSet, rootPart and rootPart.Position)
+		target = findTarget(zone.Id, tierSet, rootPart and rootPart.Position, ctx)
 		if target then
 			return target
 		end
@@ -890,7 +1020,7 @@ local function teleportThroughSpawns(zone, tierSet, runId)
 	end
 
 	setStatus("Moving to HardSpawn...")
-	target = teleportToSpawn(hardSpawn, zone, tierSet, runId)
+	target = teleportToSpawn(hardSpawn, zone, tierSet, runId, ctx)
 	if target then
 		return target
 	end
@@ -898,7 +1028,7 @@ local function teleportThroughSpawns(zone, tierSet, runId)
 	local bossSpawn = getSpawnByName(spawnFolder, "BossSpawn")
 	if bossSpawn then
 		setStatus("Moving to BossSpawn...")
-		target = teleportToSpawn(bossSpawn, zone, tierSet, runId)
+		target = teleportToSpawn(bossSpawn, zone, tierSet, runId, ctx)
 		if target then
 			return target
 		end
@@ -930,7 +1060,7 @@ local function teleportThroughSpawns(zone, tierSet, runId)
 		attempts += 1
 
 		setStatus("Checking another " .. nextSpawn.Name .. "...")
-		target = teleportToSpawn(nextSpawn, zone, tierSet, runId)
+		target = teleportToSpawn(nextSpawn, zone, tierSet, runId, ctx)
 		if target then
 			return target
 		end
@@ -939,7 +1069,7 @@ local function teleportThroughSpawns(zone, tierSet, runId)
 	return nil
 end
 
-local function streamScanZone(zone, tierSet, runId)
+local function streamScanZone(zone, tierSet, runId, ctx)
 	local queue = {}
 	local seen = {}
 	local areaAdded = false
@@ -1015,7 +1145,7 @@ local function streamScanZone(zone, tierSet, runId)
 		task.wait(0.3)
 
 		local _, _, rootPart = getCharacter()
-		local target = findTarget(zone.Id, tierSet, rootPart and rootPart.Position)
+		local target = findTarget(zone.Id, tierSet, rootPart and rootPart.Position, ctx)
 		if target then
 			return target
 		end
@@ -1024,22 +1154,22 @@ local function streamScanZone(zone, tierSet, runId)
 	end
 
 	local _, _, rootPart = getCharacter()
-	return findTarget(zone.Id, tierSet, rootPart and rootPart.Position)
+	return findTarget(zone.Id, tierSet, rootPart and rootPart.Position, ctx)
 end
 
-local function warmUpZone(zone, tierSet, runId)
+local function warmUpZone(zone, tierSet, runId, ctx)
 	local _, _, rootPart = getCharacter()
 	if not rootPart then
 		return nil
 	end
 
-	local target = teleportThroughSpawns(zone, tierSet, runId)
+	local target = teleportThroughSpawns(zone, tierSet, runId, ctx)
 	if target then
 		return target
 	end
 
 	setStatus("Streaming zone areas to find the selected rarity...")
-	target = streamScanZone(zone, tierSet, runId)
+	target = streamScanZone(zone, tierSet, runId, ctx)
 	if target then
 		return target
 	end
@@ -1061,10 +1191,10 @@ local function warmUpZone(zone, tierSet, runId)
 	task.wait(0.35)
 
 	local _, _, currentRoot = getCharacter()
-	return findTarget(zone.Id, tierSet, currentRoot and currentRoot.Position)
+	return findTarget(zone.Id, tierSet, currentRoot and currentRoot.Position, ctx)
 end
 
-local function waitForTarget(zoneId, tierSet, runId)
+local function waitForTarget(zoneId, tierSet, runId, ctx)
 	local deadline = os.clock() + ZONE_LOAD_TIMEOUT
 
 	repeat
@@ -1081,7 +1211,7 @@ local function waitForTarget(zoneId, tierSet, runId)
 			return nil, "leftZone"
 		end
 
-		local target = findTarget(zoneId, tierSet, rootPart.Position)
+		local target = findTarget(zoneId, tierSet, rootPart.Position, ctx)
 		if target then
 			return target, nil
 		end
@@ -1146,10 +1276,11 @@ local function getFollowerDistances(referencePosition)
 	return count, closest, farthest
 end
 
-local function waitForFollowers(runId, isAuto)
+local function waitForFollowers(runId, isAuto, prefix)
 	local deadline = os.clock() + FOLLOWER_WAIT_TIMEOUT
 	local stableSince = nil
 	local lastCount = -1
+	prefix = prefix or (isAuto and "Auto Farm: " or "")
 
 	repeat
 		if not isCurrentRun(runId) then
@@ -1174,13 +1305,13 @@ local function waitForFollowers(runId, isAuto)
 		if count > 0 then
 			setStatus(string.format(
 				"%sWaiting for followers (%d, near %.0f, far %.0f)...",
-				isAuto and "Auto Farm: " or "",
+				prefix,
 				count,
 				closest,
 				farthest
 			))
 		else
-			setStatus(string.format("%sWaiting for followers to appear...", isAuto and "Auto Farm: " or ""))
+			setStatus(string.format("%sWaiting for followers to appear...", prefix))
 		end
 
 		if count > 0 and farthest <= FOLLOWER_MAX_DISTANCE and closest <= FOLLOWER_MIN_CLOSE then
@@ -1198,18 +1329,25 @@ local function waitForFollowers(runId, isAuto)
 	return false, "Your followers did not catch up. The punch was cancelled."
 end
 
-local function farmOnce(isAuto)
+local function farmOnce(isAuto, override)
 	if state.busy then
 		return false, nil, state.runId, "busy"
 	end
 
-	local zone = state.zone
-	local tierSet = state.tierSet
-	local rarityLabels = state.rarityLabels
+	local zone = override and override.zone or state.zone
+	local tierSet = override and override.tierSet or state.tierSet
+	local rarityLabels = override and override.rarityLabels or state.rarityLabels
+	local tierByLabel = override and override.tierByLabel or state.tierByLabel
+	local prefix = override and override.prefix or (isAuto and "Auto Farm: " or "")
 	if not zone or #rarityLabels == 0 or next(tierSet) == nil then
 		return false, nil, state.runId, "Choose a zone and at least one rarity first."
 	end
 
+	local ctx = {
+		zone = zone,
+		tierByLabel = tierByLabel,
+		kind = override and override.kind or nil,
+	}
 	local rarityText = table.concat(rarityLabels, ", ")
 
 	state.busy = true
@@ -1225,7 +1363,7 @@ local function farmOnce(isAuto)
 		return false, nil, runId, message
 	end
 
-	setStatus(string.format("%sUsing the pad to travel to %s...", isAuto and "Auto Farm: " or "", zone.Name or zone.Id))
+	setStatus(string.format("%sUsing the pad to travel to %s...", prefix, zone.Name or zone.Id))
 
 	local ok, err = travelToZone(zone, runId)
 	if not ok then
@@ -1251,12 +1389,12 @@ local function farmOnce(isAuto)
 		return false, nil, runId, "cancelled"
 	end
 
-	setStatus(string.format("%sWalking in %s to render %s...", isAuto and "Auto Farm: " or "", zone.Name or zone.Id, rarityText))
+	setStatus(string.format("%sWalking in %s to render %s...", prefix, zone.Name or zone.Id, rarityText))
 	local _, _, immediateRoot = getCharacter()
-	local target = immediateRoot and findTarget(zone.Id, tierSet, immediateRoot.Position) or nil
+	local target = immediateRoot and findTarget(zone.Id, tierSet, immediateRoot.Position, ctx) or nil
 
 	if not target then
-		target = warmUpZone(zone, tierSet, runId)
+		target = warmUpZone(zone, tierSet, runId, ctx)
 	end
 
 	if not isCurrentRun(runId) then
@@ -1265,12 +1403,12 @@ local function farmOnce(isAuto)
 	end
 
 	if not target then
-		setStatus(string.format("%sLooking for %s in %s...", isAuto and "Auto Farm: " or "", rarityText, zone.Name or zone.Id))
+		setStatus(string.format("%sLooking for %s in %s...", prefix, rarityText, zone.Name or zone.Id))
 	end
 
 	local waitError = nil
 	if not target then
-		target, waitError = waitForTarget(zone.Id, tierSet, runId)
+		target, waitError = waitForTarget(zone.Id, tierSet, runId, ctx)
 	end
 
 	if not isCurrentRun(runId) then
@@ -1300,14 +1438,14 @@ local function farmOnce(isAuto)
 	local petName = target:GetAttribute("DisplayName") or target.Name
 	local petTier = target:GetAttribute("Tier")
 	local petRarity = "Selected"
-	for label, tier in pairs(state.tierByLabel) do
+	for label, tier in pairs(tierByLabel) do
 		if tier == petTier then
 			petRarity = label
 			break
 		end
 	end
 
-	setStatus(string.format("%sFound %s (%s). Teleporting to it...", isAuto and "Auto Farm: " or "", petName, petRarity))
+	setStatus(string.format("%sFound %s (%s). Teleporting to it...", prefix, petName, petRarity))
 	if not teleportToTarget(target, runId) then
 		return fail("The pet or your character disappeared before the punch.")
 	end
@@ -1317,7 +1455,7 @@ local function farmOnce(isAuto)
 		return false, nil, runId, "cancelled"
 	end
 
-	local followersReady, followerError = waitForFollowers(runId, isAuto)
+	local followersReady, followerError = waitForFollowers(runId, isAuto, prefix)
 	if not followersReady then
 		if followerError == "cancelled" then
 			state.busy = false
@@ -1337,9 +1475,10 @@ local function farmOnce(isAuto)
 
 	PunchRemote:FireServer(target)
 	target:SetAttribute("_myPunchAt", os.clock())
+	markAnnouncementHandled(zone, target)
 	state.busy = false
 
-	setStatus(string.format("%sPunched %s (%s).", isAuto and "Auto Farm: " or "", petName, petRarity))
+	setStatus(string.format("%sPunched %s (%s).", prefix, petName, petRarity))
 	if not isAuto then
 		notify("Battle started", petName .. " (" .. petRarity .. ")", "Success")
 	end
@@ -1347,10 +1486,11 @@ local function farmOnce(isAuto)
 	return true, target, runId
 end
 
-local function waitForBattleEnd(target, runId)
+local function waitForBattleEnd(target, runId, prefix)
 	local deadline = os.clock() + BATTLE_WAIT_TIMEOUT
 	local lastUpdate = 0
 	local targetName = target:GetAttribute("DisplayName") or target.Name
+	prefix = prefix or "Auto Farm: "
 
 	while state.running and state.autoFarm and state.runId == runId do
 		local hp = target:GetAttribute("HP") or 0
@@ -1367,7 +1507,7 @@ local function waitForBattleEnd(target, runId)
 		if os.clock() - lastUpdate >= 1 then
 			lastUpdate = os.clock()
 			local percent = if maxHp > 0 then math.clamp(math.floor((hp / maxHp) * 100), 0, 100) else 0
-			setStatus(string.format("Auto Farm: fighting %s (%d%% HP)...", targetName, percent))
+			setStatus(string.format("%sfighting %s (%d%% HP)...", prefix, targetName, percent))
 		end
 
 		if os.clock() >= deadline then
@@ -1385,11 +1525,86 @@ local function getHomeCycleWait()
 	return math.clamp(value or HOME_CYCLE_WAIT_DEFAULT, HOME_CYCLE_WAIT_MIN, HOME_CYCLE_WAIT_MAX)
 end
 
+local function getOwnWarDrum()
+	local camp = Workspace:FindFirstChild("Camp")
+	local plots = camp and camp:FindFirstChild("Plots")
+	local plot = LocalPlayer:GetAttribute("Plot")
+	local plotFolder = plots and plot ~= nil and plots:FindFirstChild("Plot" .. tostring(plot))
+	return plotFolder and plotFolder:FindFirstChild("WarDrum")
+end
+
+local function ensureDrumming()
+	if LocalPlayer:GetAttribute("Home") ~= true then
+		return false
+	end
+
+	if LocalPlayer:GetAttribute("Drumming") == true then
+		return true
+	end
+
+	local drum = getOwnWarDrum()
+	if not drum then
+		return false
+	end
+
+	local anchor = drum:FindFirstChild("PlaySpot", true) or drum:FindFirstChild("Skin", true)
+	if anchor and not anchor:IsA("BasePart") then
+		anchor = anchor.PrimaryPart or anchor:FindFirstChildWhichIsA("BasePart", true)
+	end
+	if not anchor or not anchor:IsA("BasePart") then
+		return false
+	end
+
+	local character = getCharacter()
+	if not character then
+		return false
+	end
+
+	character:PivotTo(CFrame.new(anchor.Position + Vector3.new(0, 3, 0)))
+	pcall(function()
+		Workspace:RequestStreamAroundAsync(anchor.Position)
+	end)
+
+	local deadline = os.clock() + 3
+	repeat
+		task.wait(0.15)
+		if LocalPlayer:GetAttribute("Drumming") == true then
+			return true
+		end
+		if LocalPlayer:GetAttribute("Home") ~= true then
+			return false
+		end
+	until os.clock() >= deadline
+
+	return LocalPlayer:GetAttribute("Drumming") == true
+end
+
 local function waitAtHome(generation)
 	local started = os.clock()
+	local drumReady = false
+	local lastDrumAttempt = 0
 
 	while state.running and state.autoFarm and state.autoFarmRunId == generation do
 		if isNightTime() then
+			return true
+		end
+
+		if not drumReady or LocalPlayer:GetAttribute("Drumming") ~= true then
+			if os.clock() - lastDrumAttempt >= 2 then
+				lastDrumAttempt = os.clock()
+				drumReady = ensureDrumming()
+			end
+		end
+
+		local snipe = takePendingSnipe()
+		if snipe then
+			state.pendingSnipe = snipe
+			setStatus(string.format(
+				"Auto Snipe: %s announced in %s. Going there...",
+				tostring(snipe.entry.rarity or "a pet"),
+				tostring(snipe.entry.zone or snipe.zone.Name or snipe.zone.Id)
+			))
+			task.wait(0.2)
 			return true
 		end
 
@@ -1420,10 +1635,17 @@ local function waitAtHome(generation)
 			return true
 		end
 
-		setStatus(string.format(
-			"Auto Farm: at home, waiting for the next spawn cycle (%.0fs left)...",
-			remaining
-		))
+		if LocalPlayer:GetAttribute("Drumming") == true then
+			setStatus(string.format(
+				"Auto Farm: drumming at home, waiting for the next spawn cycle (%.0fs left)...",
+				remaining
+			))
+		else
+			setStatus(string.format(
+				"Auto Farm: at home, waiting for the next spawn cycle (%.0fs left)...",
+				remaining
+			))
+		end
 		task.wait(0.5)
 	end
 
@@ -1458,7 +1680,34 @@ runAutoFarm = function(generation)
 		end
 
 		local petName = #state.rarityLabels > 0 and table.concat(state.rarityLabels, ", ") or "selected rarities"
-		local ok, target, runId, farmError = farmOnce(true)
+		local prefix = "Auto Farm: "
+		local override = nil
+		local snipe = state.pendingSnipe
+		state.pendingSnipe = nil
+		if not snipe then
+			snipe = takePendingSnipe()
+		end
+
+		if snipe then
+			petName = snipe.entry.rarity or "selected rarity"
+			prefix = "Auto Snipe: "
+			setStatus(string.format(
+				"%s%s announced in %s. Traveling there...",
+				prefix,
+				tostring(snipe.entry.rarity or "a pet"),
+				tostring(snipe.entry.zone or snipe.zone.Name or snipe.zone.Id)
+			))
+			override = {
+				zone = snipe.zone,
+				tierSet = snipe.tierSet,
+				rarityLabels = snipe.rarityLabels,
+				tierByLabel = snipe.tierByLabel,
+				kind = snipe.kind,
+				prefix = prefix,
+			}
+		end
+
+		local ok, target, runId, farmError = farmOnce(true, override)
 
 		if not state.running or not state.autoFarm or state.autoFarmRunId ~= generation then
 			break
@@ -1466,8 +1715,8 @@ runAutoFarm = function(generation)
 
 		if ok and target then
 			petName = target:GetAttribute("DisplayName") or target.Name
-			setStatus("Auto Farm: waiting for the battle with " .. petName .. "...")
-			waitForBattleEnd(target, runId)
+			setStatus(prefix .. "waiting for the battle with " .. petName .. "...")
+			waitForBattleEnd(target, runId, prefix)
 			if state.running and state.autoFarm and state.autoFarmRunId == generation then
 				task.wait(1)
 			end
@@ -1476,7 +1725,7 @@ runAutoFarm = function(generation)
 				break
 			end
 		else
-			setStatus("Auto Farm: " .. tostring(farmError or "no target found") .. " Retrying...")
+			setStatus(prefix .. tostring(farmError or "no target found") .. " Retrying...")
 			task.wait(AUTO_FARM_RETRY)
 		end
 	end
@@ -1800,6 +2049,10 @@ task.spawn(function()
 	while state.running do
 		task.wait(1)
 
+		if autoSnipeToggle then
+			state.snipeAnnouncements = autoSnipeToggle.Value == true
+		end
+
 		if antiAfkToggle then
 			local enabled = antiAfkToggle.Value == true
 			if enabled ~= state.antiAfk then
@@ -1828,3 +2081,4 @@ task.spawn(function()
 end)
 
 Main:Select()
+

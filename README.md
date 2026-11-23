@@ -12,7 +12,9 @@ Roblox automation script for **Summon a Pet Army**, built with [BPUI](https://gi
 - Auto Equip Best
 - Night-cycle pause and return-home handling
 - Home wait for the next spawn-cycle announcement (adjustable in the UI)
+- Automatic drumming at home while waiting for the next cycle
 - Announcement matching for selected zones and rarities
+- Cross-zone announcement sniping: matching rarities are chased into whatever zone they spawned
 - Anti-AFK keepalive toggle in the Settings tab
 
 ## Usage
@@ -21,6 +23,7 @@ Roblox automation script for **Summon a Pet Army**, built with [BPUI](https://gi
 2. Execute `PetArmyZonePunch.luau` with your executor.
 3. In the **Main** tab, select a zone and one or more rarities.
 4. Enable **Auto Farm**, **Auto Summon**, and/or **Auto Equip Best**.
+5. Keep **Snipe Matching Announcements** enabled to automatically travel to a matching rarity's zone.
 
 ## Notes
 
