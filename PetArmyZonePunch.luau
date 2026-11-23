@@ -793,66 +793,124 @@ local function getSpawnByName(spawnFolder, name)
 	return nil
 end
 
-local function ensureSpawnsRendered(zone, runId)
+local function teleportToSpawn(spawn, zone, tierSet, runId)
+	local character = getCharacter()
+	if not character or not spawn then
+		return nil
+	end
+
+	character:PivotTo(spawn.CFrame + Vector3.new(0, 4, 0))
+	pcall(function()
+		Workspace:RequestStreamAroundAsync(spawn.Position)
+	end)
+	task.wait(0.4)
+
+	if not isCurrentRun(runId) then
+		return nil
+	end
+
+	local _, _, rootPart = getCharacter()
+	return findTarget(zone.Id, tierSet, rootPart and rootPart.Position)
+end
+
+local function teleportThroughSpawns(zone, tierSet, runId)
+	local deadline = os.clock() + 6
 	local spawnFolder = nil
 	local easySpawn = nil
-	local deadline = os.clock() + 5
 
 	repeat
 		local zoneFolder = getZoneFolder(zone)
 		spawnFolder = zoneFolder and zoneFolder:FindFirstChild("CreatureSpawns")
-		if getSpawnByName(spawnFolder, "HardSpawn") then
-			return true
-		end
-
 		easySpawn = getSpawnByName(spawnFolder, "EasySpawn")
 		if easySpawn then
 			break
 		end
-
 		task.wait(0.15)
 	until not isCurrentRun(runId) or os.clock() >= deadline
 
 	if not easySpawn then
-		return false
-	end
-
-	local character = getCharacter()
-	if not character then
-		return false
+		return nil
 	end
 
 	setStatus("Moving to EasySpawn...")
-	character:PivotTo(easySpawn.CFrame + Vector3.new(0, 4, 0))
-	pcall(function()
-		Workspace:RequestStreamAroundAsync(easySpawn.Position)
-	end)
-	task.wait(0.4)
+	local target = teleportToSpawn(easySpawn, zone, tierSet, runId)
+	if target then
+		return target
+	end
 
 	setStatus("Waiting for HardSpawn to render...")
 	deadline = os.clock() + 10
-	local nextPing = 0
+	local hardSpawn = nil
 
 	while isCurrentRun(runId) and os.clock() < deadline do
 		local zoneFolder = getZoneFolder(zone)
 		spawnFolder = zoneFolder and zoneFolder:FindFirstChild("CreatureSpawns")
-		if getSpawnByName(spawnFolder, "HardSpawn") then
-			setStatus("HardSpawn rendered. Starting target search...")
-			task.wait(0.4)
-			return true
+		hardSpawn = getSpawnByName(spawnFolder, "HardSpawn")
+		if hardSpawn then
+			break
 		end
 
-		if os.clock() >= nextPing then
-			nextPing = os.clock() + 1
-			pcall(function()
-				Workspace:RequestStreamAroundAsync(easySpawn.Position)
-			end)
+		local _, _, rootPart = getCharacter()
+		target = findTarget(zone.Id, tierSet, rootPart and rootPart.Position)
+		if target then
+			return target
 		end
 
 		task.wait(0.2)
 	end
 
-	return false
+	if not hardSpawn then
+		return nil
+	end
+
+	setStatus("Moving to HardSpawn...")
+	target = teleportToSpawn(hardSpawn, zone, tierSet, runId)
+	if target then
+		return target
+	end
+
+	local bossSpawn = getSpawnByName(spawnFolder, "BossSpawn")
+	if bossSpawn then
+		setStatus("Moving to BossSpawn...")
+		target = teleportToSpawn(bossSpawn, zone, tierSet, runId)
+		if target then
+			return target
+		end
+	end
+
+	local visited = {}
+	visited[string.format("%.0f:%.0f", easySpawn.Position.X, easySpawn.Position.Z)] = true
+	visited[string.format("%.0f:%.0f", hardSpawn.Position.X, hardSpawn.Position.Z)] = true
+
+	local remainingDeadline = os.clock() + 10
+	local attempts = 0
+
+	while isCurrentRun(runId) and os.clock() < remainingDeadline and attempts < 8 do
+		local nextSpawn = nil
+		for _, spawn in ipairs(getZoneSpawnPoints(zone)) do
+			local key = string.format("%.0f:%.0f", spawn.Position.X, spawn.Position.Z)
+			if not visited[key] then
+				nextSpawn = spawn
+				break
+			end
+		end
+
+		if not nextSpawn then
+			break
+		end
+
+		local key = string.format("%.0f:%.0f", nextSpawn.Position.X, nextSpawn.Position.Z)
+		visited[key] = true
+		attempts += 1
+
+		setStatus("Checking another " .. nextSpawn.Name .. "...")
+		target = teleportToSpawn(nextSpawn, zone, tierSet, runId)
+		if target then
+			return target
+		end
+	end
+
+	return nil
 end
 
 local function streamScanZone(zone, tierSet, runId)
@@ -949,12 +1007,13 @@ local function warmUpZone(zone, tierSet, runId)
 		return nil
 	end
 
-	if not ensureSpawnsRendered(zone, runId) then
-		return nil
+	local target = teleportThroughSpawns(zone, tierSet, runId)
+	if target then
+		return target
 	end
 
 	setStatus("Streaming zone areas to find the selected rarity...")
-	local target = streamScanZone(zone, tierSet, runId)
+	target = streamScanZone(zone, tierSet, runId)
 	if target then
 		return target
 	end
