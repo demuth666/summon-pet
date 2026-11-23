@@ -25,7 +25,9 @@ local TARGET_LOAD_TIMEOUT = 5
 local WAIT_BEFORE_PUNCH = 1.25
 local AUTO_FARM_RETRY = 2
 local BATTLE_WAIT_TIMEOUT = 60
-local HOME_RESTART_DELAY = 25
+local HOME_CYCLE_WAIT_MIN = 10
+local HOME_CYCLE_WAIT_MAX = 300
+local HOME_CYCLE_WAIT_DEFAULT = 60
 local FOLLOWER_WAIT_TIMEOUT = 12
 local FOLLOWER_MAX_DISTANCE = 220
 local FOLLOWER_MIN_CLOSE = 80
@@ -48,6 +50,7 @@ local state = {
 	rarityLabels = {},
 	tierSet = {},
 	tierByLabel = {},
+	homeCycleWait = HOME_CYCLE_WAIT_DEFAULT,
 }
 
 local runAutoFarm = nil
@@ -192,8 +195,8 @@ local function getRarityChoices(zone)
 	return options, tierByLabel
 end
 
-local function announcementMatches(entry, zone, rarityLabels)
-	if not entry or not zone or not rarityLabels then
+local function announcementInZone(entry, zone)
+	if not entry or not zone then
 		return false
 	end
 
@@ -209,6 +212,14 @@ local function announcementMatches(entry, zone, rarityLabels)
 		end
 	end
 
+	return true
+end
+
+local function announcementMatches(entry, zone, rarityLabels)
+	if not announcementInZone(entry, zone) or not rarityLabels then
+		return false
+	end
+
 	for _, label in ipairs(rarityLabels) do
 		if entry.rarity == label then
 			return true
@@ -218,14 +229,14 @@ local function announcementMatches(entry, zone, rarityLabels)
 	return false
 end
 
-local function recentAnnouncement(zone, rarityLabels, since)
+local function recentZoneAnnouncement(zone, since)
 	for index = #announcementHistory, 1, -1 do
 		local entry = announcementHistory[index]
 		if entry.received < since then
 			break
 		end
 
-		if announcementMatches(entry, zone, rarityLabels) then
+		if announcementInZone(entry, zone) then
 			return entry
 		end
 	end
@@ -423,6 +434,7 @@ local status = BattleSection:AddParagraph({
 local rarityDropdown = nil
 local autoSummonToggle = nil
 local antiAfkToggle = nil
+local homeCycleWaitSlider = nil
 
 local function setStatus(message)
 	if state.running then
@@ -504,6 +516,20 @@ BattleSection:AddToggle({
 			state.busy = false
 			setStatus("Auto Farm stopped.")
 		end
+	end,
+})
+
+homeCycleWaitSlider = BattleSection:AddSlider({
+	Name = "Home Cycle Wait",
+	Description = "Max seconds to wait at home for the next spawn-cycle announcement before returning to the zone.",
+	Default = HOME_CYCLE_WAIT_DEFAULT,
+	Min = HOME_CYCLE_WAIT_MIN,
+	Max = HOME_CYCLE_WAIT_MAX,
+	Increment = 5,
+	Suffix = "s",
+	Flag = "HomeCycleWait",
+	Callback = function(value)
+		state.homeCycleWait = math.clamp(tonumber(value) or HOME_CYCLE_WAIT_DEFAULT, HOME_CYCLE_WAIT_MIN, HOME_CYCLE_WAIT_MAX)
 	end,
 })
 
@@ -1264,7 +1290,7 @@ local function farmOnce(isAuto)
 		local message = string.format("No available pet matching %s was found in %s.", rarityText, zone.Name or zone.Id)
 		if goHome() then
 			state.busy = false
-			setStatus(message .. " Returned home and waiting for the next cycle.")
+			setStatus(message .. " Returned home and waiting for the next spawn cycle.")
 			return false, nil, runId, "__HOME__"
 		end
 
@@ -1354,6 +1380,11 @@ local function waitForBattleEnd(target, runId)
 	return false
 end
 
+local function getHomeCycleWait()
+	local value = homeCycleWaitSlider and tonumber(homeCycleWaitSlider.Value) or state.homeCycleWait
+	return math.clamp(value or HOME_CYCLE_WAIT_DEFAULT, HOME_CYCLE_WAIT_MIN, HOME_CYCLE_WAIT_MAX)
+end
+
 local function waitAtHome(generation)
 	local started = os.clock()
 
@@ -1362,23 +1393,37 @@ local function waitAtHome(generation)
 			return true
 		end
 
-		local announcement = recentAnnouncement(state.zone, state.rarityLabels, started)
+		local announcement = recentZoneAnnouncement(state.zone, started)
 		if announcement then
-			setStatus(string.format(
-				"Auto Farm: announced %s in %s. Going to zone...",
-				tostring(announcement.rarity),
-				tostring(announcement.zone or state.zone.Name or state.zone.Id)
-			))
+			local rarity = tostring(announcement.rarity or "a pet")
+			local isSelected = announcementMatches(announcement, state.zone, state.rarityLabels)
+
+			if isSelected then
+				setStatus(string.format(
+					"Auto Farm: announced %s in %s. Going to zone...",
+					rarity,
+					tostring(announcement.zone or state.zone.Name or state.zone.Id)
+				))
+			else
+				setStatus(string.format(
+					"Auto Farm: next spawn cycle announced (%s). Going back to the zone...",
+					rarity
+				))
+			end
+
 			task.wait(0.5)
 			return true
 		end
 
-		local remaining = math.max(0, HOME_RESTART_DELAY - (os.clock() - started))
+		local remaining = math.max(0, getHomeCycleWait() - (os.clock() - started))
 		if remaining <= 0 then
 			return true
 		end
 
-		setStatus(string.format("Auto Farm: at home, waiting %.0fs for a matching announcement...", remaining))
+		setStatus(string.format(
+			"Auto Farm: at home, waiting for the next spawn cycle (%.0fs left)...",
+			remaining
+		))
 		task.wait(0.5)
 	end
 

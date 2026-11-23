@@ -11,6 +11,7 @@ Roblox automation script for **Summon a Pet Army**, built with [BPUI](https://gi
 - Auto Summon using the game's summon remote
 - Auto Equip Best
 - Night-cycle pause and return-home handling
+- Home wait for the next spawn-cycle announcement (adjustable in the UI)
 - Announcement matching for selected zones and rarities
 - Anti-AFK keepalive toggle in the Settings tab
 
