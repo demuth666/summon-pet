@@ -42,6 +42,8 @@ local state = {
 	autoSummonHeartbeat = 0,
 	autoEquipBest = false,
 	autoEquipBestRunId = 0,
+	antiAfk = false,
+	antiAfkRunId = 0,
 	zone = nil,
 	rarityLabels = {},
 	tierSet = {},
@@ -51,6 +53,7 @@ local state = {
 local runAutoFarm = nil
 local runAutoSummon = nil
 local runAutoEquipBest = nil
+local antiAfkConnection = nil
 
 local soulQueue = {}
 
@@ -397,6 +400,14 @@ local Window = BPUI:CreateWindow({
 		state.autoSummonRunId += 1
 		state.autoEquipBest = false
 		state.autoEquipBestRunId += 1
+		state.antiAfk = false
+		state.antiAfkRunId += 1
+		if antiAfkConnection then
+			pcall(function()
+				antiAfkConnection:Disconnect()
+			end)
+			antiAfkConnection = nil
+		end
 		state.runId += 1
 		state.busy = false
 	end,
@@ -411,6 +422,7 @@ local status = BattleSection:AddParagraph({
 
 local rarityDropdown = nil
 local autoSummonToggle = nil
+local antiAfkToggle = nil
 
 local function setStatus(message)
 	if state.running then
@@ -425,6 +437,44 @@ local function notify(title, content, notificationType)
 		Type = notificationType or "Info",
 		Duration = 4,
 	})
+end
+
+local function antiAfkPulse()
+	pcall(function()
+		local virtualUser = game:GetService("VirtualUser")
+		virtualUser:CaptureController()
+		virtualUser:ClickButton2(Vector2.new(0, 0))
+	end)
+end
+
+local function setAntiAfk(enabled)
+	state.antiAfk = enabled
+	state.antiAfkRunId += 1
+	local generation = state.antiAfkRunId
+
+	if antiAfkConnection then
+		pcall(function()
+			antiAfkConnection:Disconnect()
+		end)
+		antiAfkConnection = nil
+	end
+
+	if not enabled then
+		return
+	end
+
+	antiAfkConnection = LocalPlayer.Idled:Connect(function()
+		antiAfkPulse()
+	end)
+
+	task.spawn(function()
+		while state.running and state.antiAfk and state.antiAfkRunId == generation do
+			task.wait(75)
+			if state.running and state.antiAfk and state.antiAfkRunId == generation then
+				antiAfkPulse()
+			end
+		end
+	end)
 end
 
 BattleSection:AddToggle({
@@ -1613,8 +1663,45 @@ rarityDropdown = BattleSection:AddDropdown({
 })
 
 task.spawn(function()
+	local settingsTab = nil
+	local deadline = os.clock() + 5
+
+	repeat
+		for _, tab in ipairs(Window._tabs or {}) do
+			if tab._isSettings then
+				settingsTab = tab
+				break
+			end
+		end
+
+		if not settingsTab then
+			task.wait(0.1)
+		end
+	until settingsTab or not state.running or os.clock() >= deadline
+
+	if settingsTab then
+		local utility = settingsTab:CreateSection("Utility")
+		antiAfkToggle = utility:AddToggle({
+			Name = "Anti AFK",
+			Description = "Prevents Roblox from kicking you for being idle.",
+			Icon = "activity",
+			Default = true,
+			Flag = "AntiAFK",
+			Callback = setAntiAfk,
+		})
+	end
+end)
+
+task.spawn(function()
 	while state.running do
 		task.wait(1)
+
+		if antiAfkToggle then
+			local enabled = antiAfkToggle.Value == true
+			if enabled ~= state.antiAfk then
+				setAntiAfk(enabled)
+			end
+		end
 
 		if autoSummonToggle and autoSummonToggle.Value == true and state.running then
 			local heartbeatAge = os.clock() - (state.autoSummonHeartbeat or 0)
